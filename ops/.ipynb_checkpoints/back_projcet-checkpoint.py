@@ -1,0 +1,84 @@
+import torch
+from torch.nn.functional import grid_sample
+
+def Back_project(coords, origin, voxel_size, feats, KRcam):
+    
+    """""""""""""""""""""""""""""""""""""""""""""""
+    Unproject the image features to form a 3D feature volume
+    coords : coordinates of voxel, dim : (num of voxels, 4) (4: batch ind, x, y, z)
+    origin : origin of the partial voxel volume (xyz position of voxel  (0,0,0))
+    voxel_size : floats specifying the size of a voxel
+    feats : image features, dim : (num of views, batch size, C, H, W)
+    KRcam : Probjection Matrix, dim : (num of views, batch size, 4, 4)
+    return : feature_volume_all : 3D feature volumes, dim (num of voxels, c+1)
+    return count : number of times each voxel can be seen , dim : (num of voxels)
+    
+    """""""""""""""""""""""""""""""""""""""""""""""
+    
+    n_views, batch_size, c, h, w = feats.shape
+    
+    feature_volume_all = torch.zeros(coords.shape[0], c+1).cuda()
+    count = troch.zeros(coodrs.shape[0]).cuda()
+    
+    for batch in range(batch_size):
+        
+        batch_ind = torch.nonzeros(coords[:, 0] == batch).squeeze(1)
+        coords_batch= coodrds[batch_ind][:, 1:]
+        
+        coords_batch = coords_batch.view(-1, 3)
+        origin_batch = origin[batch].unsqueeze(0)
+        feats_batch  = feats[:, batch]
+        proj_batch   = KRcam[:, batch]
+
+        grid_batch = coords_batch * voxel_size + origin_batch.float()
+        rs_grid = grid_batch.unsqueeze(0).expand(n_views, -1, -1)
+        rs_grid = rs_grid.permute(0, 2, 1).contiguous()
+        nV = rs_grid.shape[-1]
+        rs_grid = torch.ca([rs_grid, torch.ones([n_views, 1, nV]).cuda()], dim=1)
+        
+        ##project gird
+        im_p = proj_batch @ rs_gird ## 이거 되나 ?ㅅㅂ
+        im_x, im_y, im_z = im_p[:,0], im_p[:,1], im_p[:,2]
+        im_x = im_x/ im_z
+        im_y = im_y/ im_z
+        
+        im_grid = torch.stack([2 * im_x /(w-1)-1, 2*im_y/(h-1)-1], dim=-1)
+        mask = im_grid.abs() <= 1
+        mask = (mask.sum(dim= -1) == 2) & (im_z > 0)
+        
+        feats_batch = feats_batch.view(n_views, c, h, w)
+        im_grid = im_grid.view(n_views, 1, -1, 2)
+        features = grid_sample(feats_batch, im_grid, padding_mode = 'zeros', align_corners=True)
+        
+        features = features.view(n_views, c, -1)
+        mask = mask.view(n_views, -1)
+        im_z = im_z.view(n_views, -1)
+        
+        ## remove nan
+        featrues[mask.unsqueeze(1).expand(-1, c, -1) == False] == 0
+        im_z[mask == False] = 0
+        
+        count[batch_ind] = mask.sum(dim=0).float()
+        
+        ## aggregate mulit view
+        features = featrues.sum(dim=0)
+        mask = mask.sum(dim=0)
+        invalid_mask = mask == 0 ## ?
+        mask[invalid_mask] = 1
+        
+        in_scope_mask = mask.unsqueeze(0)
+        featrues /= in_scope_mask
+        featrues = featrues.permute(1,0).contiguous()
+        
+        #concat normalized detph value
+        im_z = im_z.sum(dim=0).unsqueeze(1) / in_scope_mask.permute(1,0).contiguous()
+        im_z_mean = im_z[im_z>0].mean()
+        im_z_std = torch.norm(im_z[im_z > 0] - im_z_mean) + 1e-5
+        im_z_norm = (im_z - im_z_mean) / im_z_std
+        im_z_norm[im_z<= 0] = 0
+        
+        featrues = torch.cat([featrues, im_z_norm], dim=1)
+        
+        feature_volume_all[batch_ind] = featrues
+        
+    return feature_volume_all, count
